@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -20,6 +21,8 @@ from pypdf import PdfReader
 # Config
 # --------------------------------------------------------------------------- #
 DEFAULT_MODEL = "gemini-3.5-flash"  # change in Streamlit secrets with GEMINI_MODEL
+FALLBACK_MODEL = "gemini-3.5-flash-lite"  # used if the main model is overloaded (GEMINI_FALLBACK_MODEL)
+RETRY_DELAYS = (2, 5, 10)  # seconds to wait between retries on temporary errors
 MAX_FILE_MB = 5
 MIN_TEXT_CHARS = 200  # below this we assume the file is scanned / unreadable
 MAX_RESUME_CHARS = 30_000  # keeps the prompt comfortably inside the context window
@@ -222,10 +225,18 @@ def normalise_result(data: dict) -> dict:
     }
 
 
-def analyse_resume(client, model: str, resume_text: str, jd: str, role: str) -> dict:
+def is_transient_error(exc: Exception) -> bool:
+    """True for temporary Gemini errors that are worth retrying (overload, timeouts)."""
+    msg = str(exc).lower()
+    markers = ("503", "502", "500", "504", "unavailable", "overloaded",
+               "high demand", "deadline", "timed out", "timeout", "internal")
+    return any(m in msg for m in markers)
+
+
+def _generate(client, model: str, prompt: str) -> dict:
     response = client.models.generate_content(
         model=model,
-        contents=build_prompt(resume_text, jd, role),
+        contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_INSTRUCTION,
             temperature=0.2,
@@ -233,6 +244,30 @@ def analyse_resume(client, model: str, resume_text: str, jd: str, role: str) -> 
         ),
     )
     return parse_model_json(response.text)
+
+
+def analyse_resume(client, model: str, resume_text: str, jd: str, role: str,
+                   fallback_model: str = "", sleep=time.sleep) -> dict:
+    """Call Gemini, retrying temporary errors and falling back to a second model."""
+    prompt = build_prompt(resume_text, jd, role)
+    models = [model]
+    if fallback_model and fallback_model != model:
+        models.append(fallback_model)
+
+    last_error = None
+    for m in models:
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                return _generate(client, m, prompt)
+            except Exception as e:  # noqa: BLE001
+                last_error = e
+                # Bad key, quota, unreadable output etc. won't fix themselves by retrying
+                if not is_transient_error(e):
+                    raise
+                if attempt < len(RETRY_DELAYS):
+                    sleep(RETRY_DELAYS[attempt])
+        # this model stayed overloaded -> move on to the fallback model
+    raise last_error
 
 
 # --------------------------------------------------------------------------- #
@@ -334,7 +369,8 @@ def main() -> None:
                 help="Get a free key at https://aistudio.google.com/apikey",
             )
         model = get_secret("GEMINI_MODEL", DEFAULT_MODEL)
-        st.caption(f"Model: `{model}`")
+        fallback_model = get_secret("GEMINI_FALLBACK_MODEL", FALLBACK_MODEL)
+        st.caption(f"Model: `{model}` (backup: `{fallback_model}`)")
         st.divider()
         st.caption("Your resume is sent to the Gemini API for analysis and is not stored by this app.")
 
@@ -382,7 +418,9 @@ def main() -> None:
 
         try:
             with st.spinner("Analysing with Gemini..."):
-                result = analyse_resume(get_client(api_key), model, text, jd, role)
+                result = analyse_resume(
+                    get_client(api_key), model, text, jd, role, fallback_model
+                )
             st.session_state["result"] = result
             st.session_state["text"] = text
         except json.JSONDecodeError:
@@ -395,6 +433,11 @@ def main() -> None:
             msg = str(e)
             if "API key" in msg or "API_KEY" in msg or "401" in msg or "403" in msg:
                 st.error("Gemini rejected the API key. Please check it and try again.")
+            elif is_transient_error(e):
+                st.error(
+                    "Google's Gemini servers are overloaded right now (tried the backup "
+                    "model too). This is temporary — please wait a minute and click Analyse again."
+                )
             elif "429" in msg or "quota" in msg.lower():
                 st.error("Rate limit or quota reached. Wait a minute and try again.")
             else:
