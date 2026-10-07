@@ -19,7 +19,7 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
-DEFAULT_MODEL = "gemini-2.5-flash"  # change in Streamlit secrets with GEMINI_MODEL
+DEFAULT_MODEL = "gemini-3.5-flash"  # change in Streamlit secrets with GEMINI_MODEL
 MAX_FILE_MB = 5
 MIN_TEXT_CHARS = 200  # below this we assume the file is scanned / unreadable
 MAX_RESUME_CHARS = 30_000  # keeps the prompt comfortably inside the context window
